@@ -55,6 +55,9 @@ class MegatronTrainRayActor(TrainRayActor):
 
         super().init(args, role, with_ref, with_opd_teacher)
 
+        if args.debug_rollout_only:
+            return 0
+
         init(args)
 
         if is_megatron_main_rank():
@@ -79,9 +82,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
                 torch_memory_saver.memory_margin_bytes = x
 
-        if self.args.debug_rollout_only:
-            return 0
-
         if role == "critic":
             self.args.load = self.args.critic_load
             self.args.save = self.args.critic_save
@@ -92,12 +92,12 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
+        start_rollout_id = loaded_rollout_id + 1
+
         if role == "critic":
             if self.args.offload_train:
                 self.sleep()
-            return
-
-        start_rollout_id = loaded_rollout_id + 1
+            return start_rollout_id
 
         self.weights_backuper = TensorBackuper.create(
             source_getter=lambda: named_params_and_buffers(
@@ -350,14 +350,14 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
     def train(self, rollout_id: int, rollout_data_ref: Box) -> None:
+        if self.args.debug_rollout_only:
+            return
+
         if self.args.offload_train:
             self.wake_up()
 
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
-            if self.args.debug_rollout_only:
-                log_rollout_data(rollout_id, self.args, rollout_data)
-                return
 
         if self.role == "critic":
             return self.train_critic(rollout_id, rollout_data)
@@ -377,7 +377,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
         )
 
-        if rollout_id >= self.args.num_critic_only_steps:
+        if rollout_id >= self.args.num_critic_only_steps and not self.args.critic_train_only:
             sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
 
         compute_advantages_and_returns(self.args, rollout_data)
@@ -538,7 +538,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.recover_rollout_engines.remote())
             dist.barrier(group=get_gloo_group())
 
-        rollout_engines, rollout_engine_lock, num_new_engines = ray.get(
+        rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
             self.rollout_manager.get_rollout_engines_and_lock.remote()
         )
 
@@ -546,7 +546,12 @@ class MegatronTrainRayActor(TrainRayActor):
             reload_process_groups()
 
         if num_new_engines > 0:
-            self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
+            self.weight_updater.connect_rollout_engines(
+                rollout_engines,
+                rollout_engine_lock,
+                engine_gpu_counts=engine_gpu_counts,
+                engine_gpu_offsets=engine_gpu_offsets,
+            )
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
